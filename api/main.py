@@ -48,6 +48,23 @@ TTS_WARMUP_ON_START = os.getenv("TTS_WARMUP_ON_START", "false").lower() == "true
 # Recommended: 15 s for AMD ROCm; harmless on NVIDIA.  Default 0 = disabled.
 GPU_KEEPALIVE_INTERVAL = int(os.getenv("GPU_KEEPALIVE_INTERVAL", "0"))
 
+# Lazy load + idle shutdown. The model can be huge (1.97 GB for the
+# 0.6B 8-bit MLX checkpoint alone) and on Apple Silicon it sits in
+# unified memory, so we don't want to load it until the first request
+# actually needs it. Likewise, on a Mac we don't want a stray server
+# process holding RAM after the user has walked away.
+#
+# TTS_LAZY_LOAD=true (default) defers backend initialization until the
+# first /v1/audio/speech call lands; the first request then pays the
+# model-load + warmup cost in one shot.
+#
+# TTS_IDLE_TIMEOUT_SECONDS=300 (default) shuts the server down after
+# that many seconds of zero /v1/audio/speech traffic. /health and
+# other read-only endpoints do not reset the timer. Set to 0 to
+# disable auto-shutdown.
+TTS_LAZY_LOAD = os.getenv("TTS_LAZY_LOAD", "true").lower() == "true"
+TTS_IDLE_TIMEOUT_SECONDS = int(os.getenv("TTS_IDLE_TIMEOUT_SECONDS", "300"))
+
 # CORS configuration
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 
@@ -62,7 +79,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for model initialization."""
-    
+
     # Print startup banner
     boundary = "░" * 24
     startup_msg = f"""
@@ -71,7 +88,7 @@ async def lifespan(app: FastAPI):
     ╔═╗┬ ┬┌─┐┌┐┌╔═╗  ╔╦╗╔╦╗╔═╗
     ║═╬╡│││├┤ │││╚═╗───║  ║ ╚═╗
     ╚═╝└┴┘└─┘┘└┘╚═╝   ╩  ╩ ╚═╝
-    
+
     OpenAI-Compatible TTS API
     Backend: {TTS_BACKEND}
 
@@ -86,26 +103,33 @@ async def lifespan(app: FastAPI):
     if ENABLE_VOICE_STUDIO:
         logger.info(f"Voice Studio: http://{display_host}:{PORT}/voice-studio")
     logger.info(boundary)
-    
-    # Pre-load the TTS backend
-    try:
-        from .backends import initialize_backend
-        logger.info(f"Initializing TTS backend: {TTS_BACKEND}")
-        backend = await initialize_backend(warmup=TTS_WARMUP_ON_START)
-        logger.info(f"TTS backend '{backend.get_backend_name()}' loaded successfully!")
-        logger.info(f"Model: {backend.get_model_id()}")
-        
-        device_info = backend.get_device_info()
-        if device_info.get("gpu_available"):
-            logger.info(f"GPU: {device_info.get('gpu_name')}")
-            logger.info(f"VRAM: {device_info.get('vram_total')}")
 
-        custom_voice_names = backend.get_custom_voice_names()
-        if custom_voice_names:
-            logger.info(f"Custom voices ({len(custom_voice_names)}): {custom_voice_names}")
-    except Exception as e:
-        logger.warning(f"Backend initialization delayed: {e}")
-        logger.info("Backend will be loaded on first request.")
+    # Lazy load: skip eager init. The model loads on the first
+    # /v1/audio/speech call. Eager init for non-lazy mode below.
+    if not TTS_LAZY_LOAD:
+        try:
+            from .backends import initialize_backend
+            logger.info(f"Initializing TTS backend: {TTS_BACKEND}")
+            backend = await initialize_backend(warmup=TTS_WARMUP_ON_START)
+            logger.info(f"TTS backend '{backend.get_backend_name()}' loaded successfully!")
+            logger.info(f"Model: {backend.get_model_id()}")
+
+            device_info = backend.get_device_info()
+            if device_info.get("gpu_available"):
+                logger.info(f"GPU: {device_info.get('gpu_name')}")
+                logger.info(f"VRAM: {device_info.get('vram_total')}")
+
+            custom_voice_names = backend.get_custom_voice_names()
+            if custom_voice_names:
+                logger.info(f"Custom voices ({len(custom_voice_names)}): {custom_voice_names}")
+        except Exception as e:
+            logger.warning(f"Backend initialization delayed: {e}")
+            logger.info("Backend will be loaded on first request.")
+    else:
+        logger.info(
+            f"Lazy load enabled — backend will initialize on first "
+            f"/v1/audio/speech request"
+        )
 
     # GPU keepalive: periodic small matmul prevents AMD DPM from downclocking the GPU
     # after idle, keeping TTFB consistently low (~0.3 s instead of ~0.85 s after idle).
@@ -141,11 +165,58 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             logger.warning(f"GPU keepalive setup failed: {exc}")
 
+    # Idle shutdown: track the timestamp of the last /v1/audio/speech
+    # request. A background task checks the timestamp every 30 s and
+    # calls os.kill(os.getpid(), SIGTERM) if the server has been idle
+    # for more than TTS_IDLE_TIMEOUT_SECONDS. Read-only endpoints
+    # like /health and /v1/models do not reset the timer.
+    idle_shutdown_task = None
+    if TTS_IDLE_TIMEOUT_SECONDS > 0:
+        import os
+        import signal
+        import time
+        app.state.last_speech_at = time.monotonic()
+        app.state.idle_timeout_seconds = TTS_IDLE_TIMEOUT_SECONDS
+        app.state.speech_request_count = 0
+        app.state.speech_total_samples = 0
+
+        async def _idle_watchdog():
+            try:
+                while True:
+                    # Check every 30s, or every second for the first
+                    # minute so we get a fast post-load activity spike.
+                    now = time.monotonic()
+                    since_last = now - app.state.last_speech_at
+                    threshold = app.state.idle_timeout_seconds
+                    if since_last >= threshold and app.state.speech_request_count > 0:
+                        logger.info(
+                            f"No /v1/audio/speech traffic for "
+                            f"{since_last:.0f}s (threshold "
+                            f"{threshold}s). Shutting down."
+                        )
+                        # SIGTERM lets uvicorn do a graceful drain.
+                        os.kill(os.getpid(), signal.SIGTERM)
+                        return
+                    if since_last < 60:
+                        await asyncio.sleep(1)
+                    else:
+                        await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                pass
+
+        idle_shutdown_task = asyncio.create_task(_idle_watchdog())
+        logger.info(
+            f"Idle shutdown enabled: SIGTERM after "
+            f"{TTS_IDLE_TIMEOUT_SECONDS}s of no /v1/audio/speech traffic"
+        )
+
     yield
 
     # Cleanup
     if keepalive_task:
         keepalive_task.cancel()
+    if idle_shutdown_task:
+        idle_shutdown_task.cancel()
     logger.info("Server shutting down...")
 
 

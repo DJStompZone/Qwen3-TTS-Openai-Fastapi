@@ -149,8 +149,27 @@ class MLXQwen3TTSBackend(TTSBackend):
                     'pip install -e ".[api,mlx]"'
                 ) from exc
 
-            logger.info("Loading MLX model: %s", self.model_name)
-            model = load_model(self.model_name)
+            # Monkey-patch AutoTokenizer to fix the Mistral regex bug.
+            # Qwen3-TTS MLX checkpoint's tokenizer_config has an
+            # incorrect regex pattern; upstream mlx-audio doesn't pass
+            # fix_mistral_regex=True yet.  This patch intercepts the
+            # call inside post_load_hook so the tokenizer loads
+            # correctly.
+            import transformers
+            _orig_from_pretrained = transformers.AutoTokenizer.from_pretrained
+
+            def _patched_from_pretrained(*args: Any, **kwargs: Any) -> Any:
+                return _orig_from_pretrained(
+                    *args, fix_mistral_regex=True, **kwargs
+                )
+
+            transformers.AutoTokenizer.from_pretrained = _patched_from_pretrained  # type: ignore[assignment]
+
+            try:
+                logger.info("Loading MLX model: %s", self.model_name)
+                model = load_model(self.model_name)
+            finally:
+                transformers.AutoTokenizer.from_pretrained = _orig_from_pretrained  # type: ignore[assignment]
 
             speaker_getter = getattr(model, "get_supported_speakers", None)
             language_getter = getattr(model, "get_supported_languages", None)

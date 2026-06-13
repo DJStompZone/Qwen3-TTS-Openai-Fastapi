@@ -206,15 +206,45 @@ def _load_voice_profile(name_or_id: str) -> dict:
 
 
 async def get_tts_backend():
-    """Get the TTS backend instance, initializing if needed."""
+    """Get the TTS backend instance, initializing if needed.
+
+    Honors lazy-load: if the backend hasn't been initialized yet, the
+    first caller pays the model-load + warmup cost in one shot. The
+    warmup is gated by the ``TTS_WARMUP_ON_START`` env var (which the
+    factory re-reads on each call). This is critical for the MLX
+    backend — the cold graph compile can wedge mlx-audio 0.3.x, and
+    warmup absorbs that cost at first-load time instead of on the
+    user's first request.
+    """
     from ..backends import get_backend, initialize_backend
-    
+
     backend = get_backend()
-    
+
     if not backend.is_ready():
-        await initialize_backend()
-    
+        warmup_enabled = os.getenv("TTS_WARMUP_ON_START", "false").lower() == "true"
+        await initialize_backend(warmup=warmup_enabled)
+
     return backend
+
+
+def note_speech_activity(app, samples: int = 0) -> None:
+    """Reset the idle-shutdown timer on a successful speech request.
+
+    Called from the /v1/audio/speech handler. Read-only endpoints
+    like /health do NOT call this, so they don't keep a quiet
+    server alive forever.
+
+    Args:
+        app: The FastAPI app instance (``request.app`` from the route).
+        samples: Number of audio samples generated, for stats.
+    """
+    import time as _time
+    state = getattr(app, "state", None)
+    if state is None:
+        return
+    state.last_speech_at = _time.monotonic()
+    state.speech_request_count = getattr(state, "speech_request_count", 0) + 1
+    state.speech_total_samples = getattr(state, "speech_total_samples", 0) + int(samples)
 
 
 def get_voice_name(voice: str) -> str:
@@ -607,6 +637,14 @@ async def create_speech(
                         f"TTS stream done: total={gen_time:.2f}s "
                         f"audio={audio_dur:.2f}s RTF={rtf:.2f}x chunks={chunk_count}"
                     )
+                    # Reset the idle-shutdown timer for this in-process
+                    # server. We do this on the streaming path's
+                    # natural completion so the timer only resets on
+                    # a real successful generation.
+                    try:
+                        note_speech_activity(client_request.app, samples=total_samples)
+                    except Exception:
+                        pass
 
                 return StreamingResponse(
                     _speech_stream(),
@@ -630,6 +668,14 @@ async def create_speech(
                 instruct=request.instruct,
                 speed=request.speed,
             )
+
+            # Reset the idle-shutdown timer for this in-process
+            # server. Read-only endpoints like /health do not touch
+            # this, so a quiet server self-terminates.
+            try:
+                note_speech_activity(client_request.app, samples=len(audio))
+            except Exception:
+                pass
 
         # Get content type
         content_type = get_content_type(request.response_format)
