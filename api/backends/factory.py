@@ -31,7 +31,8 @@ def get_backend() -> TTSBackend:
     - "vllm_omni": Use vLLM-Omni for faster inference
     - "pytorch": CPU-optimized PyTorch backend
     - "openvino": Experimental OpenVINO backend for Intel CPUs
-    
+    - "mlx": Apple Silicon MLX backend (lazy-imported, requires `.[mlx]` extra)
+
     Returns:
         TTSBackend instance
     """
@@ -116,19 +117,41 @@ def get_backend() -> TTSBackend:
             ov_device=ov_device,
             ov_cache_dir=ov_cache_dir,
         )
-        
+
         logger.info(f"Using experimental OpenVINO backend")
         logger.info(f"Model dir: {ov_model_dir}, Device: {ov_device}")
         logger.warning(
             "OpenVINO backend is experimental and requires manual model export. "
             "For reliable CPU inference, use TTS_BACKEND=pytorch instead."
         )
-    
+
+    elif backend_type == "mlx":
+        # Apple Silicon MLX backend. Imported lazily so Linux and CUDA users
+        # do not need the Apple-only `mlx-audio` package installed.
+        from .mlx_qwen3_tts import (
+            DEFAULT_MLX_MODEL,
+            MLXQwen3TTSBackend,
+        )
+
+        # Use a separate MLX-specific variable so the default official
+        # TTS_MODEL_ID does not accidentally select a non-MLX checkpoint.
+        mlx_model_name = os.getenv("MLX_MODEL_ID", DEFAULT_MLX_MODEL)
+
+        _backend_instance = MLXQwen3TTSBackend(
+            model_name=mlx_model_name,
+        )
+
+        logger.info(
+            "Using Apple Silicon MLX backend with model: %s",
+            mlx_model_name,
+        )
+
     else:
         logger.error(f"Unknown backend type: {backend_type}")
         raise ValueError(
             f"Unknown TTS_BACKEND: {backend_type}. "
-            f"Supported values: 'optimized', 'official', 'vllm_omni', 'pytorch', 'openvino'"
+            f"Supported values: 'optimized', 'official', 'vllm_omni', "
+            f"'pytorch', 'openvino', 'mlx'"
         )
     
     return _backend_instance
@@ -171,9 +194,21 @@ async def initialize_backend(warmup: bool = False) -> TTSBackend:
                 "Hello, this is a warmup test.",
                 "Hello, this is a longer warmup test to exercise the full decode pipeline.",
             ]
+            # Per-request wall-clock cap during warmup. If a warmup
+            # request takes longer than this, the model is in a bad
+            # state (mlx-audio 0.3.x can take 30-180s per request
+            # when the graph compile went wrong). We treat that as a
+            # failed warmup so the user sees the error in the boot log
+            # instead of on their first request.
+            import time
+            _warmup_max_seconds = float(
+                os.getenv("TTS_WARMUP_MAX_SECONDS", "10.0")
+            )
             try:
                 custom_names = backend.get_custom_voice_names()
+                warmup_failed = False
                 for i, _text in enumerate(_warmup_texts, 1):
+                    t0 = time.monotonic()
                     if backend.get_model_type() == "base" and custom_names:
                         await backend.generate_speech_with_custom_voice(
                             text=_text,
@@ -189,8 +224,71 @@ async def initialize_backend(warmup: bool = False) -> TTSBackend:
                             voice="Vivian",
                             language="English",
                         )
-                    logger.info(f"Warmup request {i}/{len(_warmup_texts)} completed")
-                logger.info("Backend warmup completed successfully")
+                    elapsed = time.monotonic() - t0
+                    logger.info(
+                        f"Warmup request {i}/{len(_warmup_texts)} completed "
+                        f"in {elapsed:.2f}s"
+                    )
+                    if elapsed > _warmup_max_seconds:
+                        logger.error(
+                            f"Warmup request {i} took {elapsed:.2f}s, which is "
+                            f"above the {_warmup_max_seconds:.0f}s cap. This "
+                            f"usually means the model is in a bad state "
+                            f"(upstream mlx-audio 0.3.x graph-compile "
+                            f"hang). The next user request is very "
+                            f"likely to hang or fail. Consider "
+                            f"restarting the server."
+                        )
+                        warmup_failed = True
+                        break
+
+                # Also exercise the streaming path if the backend exposes
+                # it. This is critical for backends whose non-streaming
+                # and streaming code paths hit different compiled
+                # graphs (notably mlx-audio 0.3.x, where the cold-start
+                # ``model.generate(stream=True)`` call hangs).
+                if not warmup_failed and hasattr(
+                    backend, "generate_speech_streaming"
+                ):
+                    logger.info("Warming up streaming path...")
+                    try:
+                        t0 = time.monotonic()
+                        async def _drain_streaming():
+                            async for _chunk, _sr in backend.generate_speech_streaming(
+                                text="Streaming warmup.",
+                                voice="Vivian",
+                                language="English",
+                            ):
+                                pass
+
+                        await _drain_streaming()
+                        elapsed = time.monotonic() - t0
+                        logger.info(
+                            f"Streaming warmup completed in {elapsed:.2f}s"
+                        )
+                        if elapsed > _warmup_max_seconds:
+                            logger.error(
+                                f"Streaming warmup took {elapsed:.2f}s, "
+                                f"above the {_warmup_max_seconds:.0f}s cap. "
+                                f"The streaming path may be in a bad "
+                                f"state."
+                            )
+                            warmup_failed = True
+                    except Exception as e:
+                        logger.warning(
+                            f"Streaming warmup failed (non-critical): {e}"
+                        )
+
+                if warmup_failed:
+                    logger.error(
+                        "Backend warmup detected bad state — the model "
+                        "is likely in a degraded state. User requests "
+                        "may fail or hang with the current process. "
+                        "Recommend restarting the server until you get "
+                        "a clean warmup."
+                    )
+                else:
+                    logger.info("Backend warmup completed successfully")
             except Exception as e:
                 logger.warning(f"Backend warmup failed (non-critical): {e}")
     

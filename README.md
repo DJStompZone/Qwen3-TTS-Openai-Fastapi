@@ -47,12 +47,14 @@ This implementation supports multiple backend engines:
 | **vLLM-Omni** | ⚡⚡⚡ Fast | ⚠️ Python 3.12 + CUDA | High-throughput, low-latency | ✅ Available |
 | **PyTorch CPU** | ⚡ Good | ✅ Simple | CPU-only systems (i5-1240P, etc.) | ✅ Stable |
 | **OpenVINO** | ⚡⚡ Better* | ⚠️ Complex | Intel CPU/NPU (experimental) | ⚠️ Experimental |
+| **MLX (Apple Silicon)** | ⚡⚡ Excellent | ✅ `.[mlx]` extra | macOS 13+ on M1/M2/M3/M4 | ✅ Available |
 
 - **Optimized Backend** (`TTS_BACKEND=optimized`): Dynamic model switching, real-time PCM streaming, torch.compile/CUDA graphs, voice prompt caching, and voice library support. Reads model config from `~/qwen3-tts/config.yaml`. **Recommended for high-throughput production deployments and voice agents.**
 - **Official Backend**: Uses the official Qwen3-TTS Python implementation with GPU/CPU auto-detect. **Recommended for most users.**
 - **vLLM-Omni Backend**: Uses [vLLM-Omni](https://docs.vllm.ai/projects/vllm-omni/) for optimized inference. Requires Python 3.12 and a dedicated Docker image. See [VLLM_BACKEND_STATUS.md](VLLM_BACKEND_STATUS.md) for details.
 - **PyTorch CPU Backend**: CPU-optimized PyTorch with threading tuning and optional IPEX support. **Recommended for CPU-only systems.** See [CPU_BACKEND_GUIDE.md](CPU_BACKEND_GUIDE.md) for details.
 - **OpenVINO Backend**: Experimental Intel CPU/NPU acceleration. Requires manual model export. **Use PyTorch CPU backend for reliable CPU inference.**
+- **MLX Backend** (`TTS_BACKEND=mlx`): Apple Silicon native inference via [mlx-audio](https://github.com/Blaizzy/mlx-audio). Lazily imported so Linux/CUDA installs stay clean. **Recommended for macOS 13+ on M1/M2/M3/M4.** See [🍎 Apple Silicon Deployment](#-apple-silicon-deployment) below.
 
 *OpenVINO may only accelerate parts of the pipeline
 
@@ -350,7 +352,7 @@ The server will start on `http://0.0.0.0:8880` by default.
 - `PORT` - Server port (default: `8880`)
 - `WORKERS` - Number of workers (default: `1`)
 - `CORS_ORIGINS` - CORS origins (default: `*`)
-- `TTS_BACKEND` - Backend engine: `optimized`, `official`, `vllm_omni`, `pytorch`, `openvino` (default: `official`)
+- `TTS_BACKEND` - Backend engine: `optimized`, `official`, `vllm_omni`, `pytorch`, `openvino`, `mlx` (default: `official`)
 - `TTS_MODEL_NAME` - Override default model (optional; not used by the `optimized` backend)
 - `TTS_WARMUP_ON_START` - Warm up backend on startup with 3 staged requests: `true` or `false` (default: `false`)
 - `TTS_MAX_CONCURRENT` - Max concurrent synthesis requests handled per API process (default: `1`)
@@ -508,6 +510,250 @@ docker run -p 8880:8880 \
 - **Subsequent requests**: ~2-3s per request
 
 📖 **See [CPU_BACKEND_GUIDE.md](CPU_BACKEND_GUIDE.md)** for complete CPU deployment guide, performance tuning, and troubleshooting.
+
+## 🍎 Apple Silicon Deployment
+
+Native macOS deployment for **Apple Silicon** (M1 / M2 / M3 / M4) using
+[mlx-audio](https://github.com/Blaizzy/mlx-audio). This is a separate
+deployment path from Docker — the MLX backend runs entirely on the Mac's
+unified memory and is currently the most reliable way to serve Qwen3-TTS
+on Apple hardware.
+
+### Requirements
+
+- macOS 13 (Ventura) or newer
+- Apple Silicon (M1 / M2 / M3 / M4) — Intel Macs are not supported
+- Python 3.10+ (3.12 recommended)
+- FFmpeg (`brew install ffmpeg`) — only needed for compressed output
+  formats (MP3, FLAC, Opus); WAV works without it
+
+### Heads-up: dependency conflict
+
+`mlx-audio 0.3.x` pins `transformers==5.0.0rc3` (a release candidate)
+while the rest of this project pins the stable `transformers==4.57.3`.
+On a Mac, use a **dedicated virtualenv** for the MLX backend — don't
+add it to an env that already has `qwen_tts` / `transformers 4.x`
+installed. The other backends (`official`, `vllm_omni`, `pytorch`,
+`openvino`, `optimized`) are unaffected because they don't pull the
+`[mlx]` extra. Linux and Windows users are not affected at all (the
+`[mlx]` extra is gated to `darwin + arm64`).
+
+### Native install
+
+```bash
+brew install python@3.12 ffmpeg
+
+git clone https://github.com/groxaxo/Qwen3-TTS-Openai-Fastapi.git
+cd Qwen3-TTS-Openai-Fastapi
+
+# Dedicated venv for the MLX backend
+python3.12 -m venv .venv-mlx
+source .venv-mlx/bin/activate
+
+python -m pip install --upgrade pip
+python -m pip install -e ".[api,mlx]"
+
+export TTS_BACKEND=mlx
+export MLX_MODEL_ID=mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit
+export WORKERS=1
+export TTS_MAX_CONCURRENT=1
+
+python -m api.main
+```
+
+The first run downloads the MLX checkpoint (~1.97 GB) into the local
+Hugging Face cache (~`~/.cache/huggingface/hub`).
+
+### Verify it works
+
+```bash
+curl http://localhost:8880/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "tts-1",
+    "voice": "Ryan",
+    "input": "Hello from Qwen three TTS running locally on Apple Silicon.",
+    "response_format": "wav",
+    "speed": 1.0
+  }' \
+  --output mac-test.wav
+```
+
+Style instructions remain available — pass `instruct` alongside the
+voice:
+
+```bash
+curl http://localhost:8880/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "tts-1",
+    "voice": "Vivian",
+    "input": "This is running entirely on the Mac.",
+    "instruct": "Warm, confident and conversational.",
+    "response_format": "wav"
+  }' \
+  --output instructed.wav
+```
+
+### Streaming
+
+`stream=true` requests use the `generate_speech_streaming()` path —
+the MLX-Audio unified `model.generate(stream=True, streaming_interval=...)`
+generator runs on a dedicated worker thread, chunks are bridged into
+FastAPI through an `asyncio.Queue`, and bytes are flushed to the client
+as soon as MLX-Audio yields them.
+
+```bash
+curl -N http://localhost:8880/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "tts-1",
+    "voice": "Ryan",
+    "input": "Streaming test: this should deliver audio as it is generated, even on Apple Silicon.",
+    "response_format": "pcm",
+    "stream": true
+  }' \
+  --output mac-stream.pcm
+```
+
+> **Caveat on chunking:** in `mlx-audio 0.3.x` the underlying generator
+> typically yields a *single* full-audio chunk per call (the
+> `streaming_interval` parameter is accepted but not yet honored — see
+> upstream issue [#720](https://github.com/Blaizzy/mlx-audio/issues/720)).
+> The transport path is still real: the first chunk reaches the client
+> as soon as MLX-Audio finishes the generation, which is faster than
+> the non-streaming path because the FastAPI side can start flushing
+> bytes to the wire immediately. Newer `mlx-audio` versions that do
+> honor `streaming_interval` will produce multiple incremental chunks
+> with no further code changes on this side.
+
+### What ships and what doesn't
+
+- ✅ Preset CustomVoice speakers: `vivian`, `serena`, `uncle_fu`, `dylan`,
+  `eric`, `ryan`, `aiden`, `ono_anna`, `sohee` (lowercase; the
+  router / API also accepts capitalized forms) with style / emotion
+  instructions
+- ✅ Languages: English, Chinese, Japanese, Korean, German, French, Russian,
+  Portuguese, Spanish, Italian (`Auto` selects automatically)
+- ✅ `instruct` parameter for voice style / emotion control
+- ✅ `speed` parameter (time-stretching via librosa)
+- ✅ Streaming (`stream=true`, `response_format=pcm`) via a worker thread
+  + `asyncio.Queue` bridge
+- ❌ **No voice cloning** with this checkpoint. The default MLX model
+  (`Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit`) is a CustomVoice model, not a
+  Base model. The `clone:ProfileName` voice-library route therefore
+  returns the standard `voice_cloning_not_supported` error (HTTP 400).
+  Switch to the `optimized` backend with a Base model on a GPU if you
+  need cloning.
+
+### Performance tips and observed numbers
+
+Reference: Apple Silicon (M-series) running `mlx-audio 0.3.0` and the
+`0.6B-CustomVoice-8bit` checkpoint.
+
+- Stick to `WORKERS=1` and `TTS_MAX_CONCURRENT=1`. MLX-Audio holds the
+  model in unified memory and concurrent requests contend for the same
+  compute; serial is the sweet spot on a single Mac.
+- Enable `TTS_WARMUP_ON_START=true` so the first user request doesn't
+  pay the model-graph-compile cost (the cold first request on a fresh
+  process can take 30-40s; subsequent warm requests drop into the
+  sub-second range for short inputs).
+- The `0.6B-CustomVoice-8bit` checkpoint is a good speed/quality
+  balance. Hugging Face lists larger 1.7B MLX builds if you have the
+  RAM.
+
+### ⚠️ Known upstream bug: intermittent model wedges (mlx-audio 0.3.x)
+
+The bundled `mlx-audio 0.3.x` has a graph-compile bug that
+**intermittently** puts the model into a degraded state on Apple
+Silicon. The bug can surface either as a hang (the model's
+generator never yields) or as extremely slow generation (60-180s
+per request, producing a few seconds of audio at most). From
+testing on an M-series Mac, the failure rate is roughly 1 in 4
+cold starts — the warmup itself usually completes in 1-3s and
+gives no warning, then a subsequent user request hits the bad
+state.
+
+**What the backend does to mitigate**
+
+- **Per-request wall-clock cap** (`MAX_GENERATION_WALL_SECONDS=30s`):
+  a hung request fails with HTTP 500 within the user's HTTP client
+  timeout window instead of waiting minutes.
+- **`_broken` flag**: once a request hits the cap, the backend is
+  marked broken and **all subsequent requests fail fast** with a
+  clear `RuntimeError` pointing at the upstream bug. This prevents
+  a long queue of wedged requests.
+- **Streaming warmup**: `TTS_WARMUP_ON_START=true` also exercises
+  `generate_speech_streaming()` at boot. mlx-audio 0.3.x's
+  non-streaming and streaming code paths maintain **separate**
+  compiled graphs, both of which need the bad cold call absorbed
+  before users hit them.
+- **Per-warmup-request timing check**: the factory logs an error
+  if any warmup request exceeds `TTS_WARMUP_MAX_SECONDS` (default
+  10s) and marks the boot as having a degraded state. This is a
+  weak signal (it doesn't always trip), but it surfaces the worst
+  case in the boot log.
+
+**Recommended deployment**
+
+- Always set `TTS_WARMUP_ON_START=true`.
+- Run the server under a **process supervisor** (systemd, launchd,
+  supervisord) that **auto-restarts on exit**. When the backend
+  marks itself broken, the user gets HTTP 500; you want the
+  process to be replaced with a fresh one so the next user
+  request hits a clean state.
+- Test the boot on every restart: the first
+  `curl /v1/audio/speech` after startup will tell you if the
+  current process is in a bad state.
+- For long-running single-process Mac servers, expect to
+  occasionally need to restart manually.
+
+**Verifying your audio is real speech**
+
+Because the bug is silent (no exception, just slow or empty
+audio), I recommend verifying the first few outputs with an
+independent ASR. I used Apple's
+[mlx-whisper](https://github.com/mlx-whisper) for verification:
+
+```bash
+# Install once
+pip install mlx-whisper
+
+# Transcribe a generated WAV
+.venv/bin/python -c "
+import mlx_whisper
+print(mlx_whisper.transcribe(
+    'mac-test.wav',
+    path_or_hf_repo='mlx-community/whisper-base-mlx',
+)['text'])
+"
+```
+
+If the transcription is empty or nonsense, the model is in a bad
+state — restart the server.
+
+Steady-state observed numbers (warm process, single-concurrent
+request, the spec's example text):
+
+| Mode | Wall | Audio | RTF |
+|---|---|---|---|
+| Non-streaming WAV (cold, first call) | ~28s | ~53s | ~0.5x (graph compile) |
+| Non-streaming WAV (warm) | ~1.6s | ~3.4s | **~0.48x** |
+| Streaming PCM (cold, first call) | ~55s | ~3.5s | first call (graph compile) |
+| Streaming PCM (warm) | ~1.4s | ~3.2s | **~0.43x** |
+| With `instruct` (warm) | ~2.7s | ~6.3s | **~0.43x** |
+
+All warm modes are faster than realtime. The cold-start cost is the
+MLX-Audio graph compile for whichever call path you hit first
+(`generate_custom_voice` for non-streaming, `model.generate(stream=True)`
+for streaming). The two paths maintain separate compiled graphs, so
+the first call to *each* on a fresh process pays this cost; subsequent
+calls of the same path are sub-second for short inputs. This is why
+`TTS_WARMUP_ON_START=true` is recommended for production.
+
+The streaming path uses the same model call as non-streaming once warm;
+the win is in flushing the first bytes to the client immediately
+rather than waiting for the encoder to finish a full WAV header.
 
 ## 🎯 API Endpoints
 
