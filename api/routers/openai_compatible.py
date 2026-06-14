@@ -12,6 +12,7 @@ import io
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -41,6 +42,88 @@ except ValueError:
     logger.warning("Invalid TTS_MAX_CONCURRENT value; falling back to 1")
     _MAX_CONCURRENT = 1
 _generation_semaphore = asyncio.Semaphore(_MAX_CONCURRENT)
+
+# --- Auto-chunking -----------------------------------------------------------
+# Long inputs are split on sentence punctuation (. ! ?) into chunks, each
+# synthesized separately and the audio concatenated back together. This keeps
+# every generation well under the backend's wall-clock cap (and below the
+# mlx-audio 0.3.x graph-compile hang threshold for long sequences), and lowers
+# memory pressure. Short inputs (a single chunk) take the original code path
+# with zero overhead.
+#   TTS_AUTOCHUNK=false       disable entirely
+#   TTS_MAX_CHUNK_CHARS=240   target max characters per chunk
+#   TTS_CHUNK_GAP_MS=120      silence inserted between merged chunks
+try:
+    _AUTOCHUNK = os.getenv("TTS_AUTOCHUNK", "true").lower() == "true"
+    _MAX_CHUNK_CHARS = max(1, int(os.getenv("TTS_MAX_CHUNK_CHARS", "240")))
+    _CHUNK_GAP_MS = max(0, int(os.getenv("TTS_CHUNK_GAP_MS", "120")))
+except ValueError:
+    logger.warning("Invalid auto-chunk env value; using defaults")
+    _AUTOCHUNK, _MAX_CHUNK_CHARS, _CHUNK_GAP_MS = True, 240, 120
+
+
+def _hard_split(segment: str, max_chars: int) -> List[str]:
+    """Split a single over-long run (no sentence breaks) on commas, then
+    on whitespace as a last resort, so no chunk exceeds max_chars."""
+    pieces, buf = [], ""
+    # Prefer comma / semicolon / colon boundaries (keep the delimiter).
+    for part in re.split(r"(?<=[,;:])\s+", segment.strip()):
+        part = part.strip()
+        if not part:
+            continue
+        if not buf:
+            buf = part
+        elif len(buf) + 1 + len(part) <= max_chars:
+            buf += " " + part
+        else:
+            pieces.append(buf)
+            buf = part
+    if buf:
+        pieces.append(buf)
+    # Anything still too long: split on word boundaries.
+    out: List[str] = []
+    for p in pieces:
+        if len(p) <= max_chars:
+            out.append(p)
+            continue
+        words, b = p.split(), ""
+        for w in words:
+            if not b:
+                b = w
+            elif len(b) + 1 + len(w) <= max_chars:
+                b += " " + w
+            else:
+                out.append(b)
+                b = w
+        if b:
+            out.append(b)
+    return out
+
+
+def _split_into_chunks(text: str, max_chars: int) -> List[str]:
+    """Split text into chunks on sentence punctuation (. ! ?), merging
+    consecutive sentences up to max_chars. Over-long sentences are hard-split."""
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    chunks: List[str] = []
+    buf = ""
+    for s in sentences:
+        s = s.strip()
+        if not s:
+            continue
+        if not buf:
+            buf = s
+        elif len(buf) + 1 + len(s) <= max_chars:
+            buf += " " + s
+        else:
+            chunks.append(buf)
+            buf = s
+    if buf:
+        chunks.append(buf)
+    out: List[str] = []
+    for c in chunks:
+        out.extend([c] if len(c) <= max_chars else _hard_split(c, max_chars))
+    return [c for c in out if c.strip()]
+# -----------------------------------------------------------------------------
 
 # Voice library: saved voice profiles used via the "clone:ProfileName" voice prefix.
 # Configurable via VOICE_LIBRARY_DIR env var; defaults to ./voice_library.
@@ -296,33 +379,59 @@ async def generate_speech(
 
     # Check custom voice BEFORE applying OpenAI alias mapping,
     # so custom voices with OpenAI alias names remain accessible.
-    if backend.is_custom_voice(voice):
-        try:
-            audio, sr = await backend.generate_speech_with_custom_voice(
-                text=text,
+    is_custom = backend.is_custom_voice(voice)
+    # Map voice name (OpenAI aliases to internal names) for built-in voices.
+    voice_name = voice if is_custom else get_voice_name(voice)
+
+    async def _synth(segment: str) -> tuple[np.ndarray, int]:
+        if is_custom:
+            return await backend.generate_speech_with_custom_voice(
+                text=segment,
                 voice=voice,
                 language=language,
                 speed=speed,
             )
-            return audio, sr
-        except Exception as e:
-            raise RuntimeError(f"Speech generation failed: {e}")
-
-    # Map voice name (OpenAI aliases to internal names)
-    voice_name = get_voice_name(voice)
-    
-    # Generate speech using the backend
-    try:
-        audio, sr = await backend.generate_speech(
-            text=text,
+        return await backend.generate_speech(
+            text=segment,
             voice=voice_name,
             language=language,
             instruct=instruct,
             speed=speed,
         )
-        
-        return audio, sr
-        
+
+    # Decide chunking. A single chunk (or disabled) takes the original path.
+    chunks = _split_into_chunks(text, _MAX_CHUNK_CHARS) if _AUTOCHUNK else [text]
+    if len(chunks) <= 1:
+        try:
+            return await _synth(text)
+        except Exception as e:
+            raise RuntimeError(f"Speech generation failed: {e}")
+
+    # Multi-chunk: synthesize each sentence-group, then merge with a short gap.
+    logger.info(
+        "Auto-chunking %d chars into %d chunks (max=%d)",
+        len(text), len(chunks), _MAX_CHUNK_CHARS,
+    )
+    try:
+        audios: List[np.ndarray] = []
+        sr = DEFAULT_SAMPLE_RATE
+        for i, seg in enumerate(chunks):
+            a, sr = await _synth(seg)
+            if a is not None and len(a):
+                audios.append(np.asarray(a))
+        if not audios:
+            raise RuntimeError("no audio produced from any chunk")
+        gap_len = int(sr * _CHUNK_GAP_MS / 1000.0)
+        gap = (
+            np.zeros(gap_len, dtype=audios[0].dtype)
+            if gap_len > 0 else None
+        )
+        merged: List[np.ndarray] = []
+        for i, a in enumerate(audios):
+            if i and gap is not None:
+                merged.append(gap)
+            merged.append(a)
+        return np.concatenate(merged), sr
     except Exception as e:
         raise RuntimeError(f"Speech generation failed: {e}")
 
