@@ -477,3 +477,76 @@ def normalize_text(text: str, options: Optional[NormalizationOptions] = None) ->
     text = text.strip()
     
     return text
+
+
+def split_text_for_tts(
+    text: str,
+    min_chars: int = 20,
+    max_chars: int = 70,
+) -> list[str]:
+    """
+    Split text into TTS-friendly chunks.
+
+    The splitter prefers sentence punctuation, then clause punctuation, then
+    word boundaries. Undersized chunks are folded into a neighbour when doing
+    so keeps the neighbour within the configured max size.
+    """
+    clean_text = " ".join(text.split())
+    if not clean_text:
+        return []
+
+    max_chars = max(1, max_chars)
+    min_chars = max(1, min(min_chars, max_chars))
+    if len(clean_text) <= max_chars:
+        return [clean_text]
+
+    chunks: list[str] = []
+    remaining = clean_text
+    sentence_punct = ".!?"
+    clause_punct = ",;:"
+
+    while len(remaining) > max_chars:
+        window = remaining[: max_chars + 1]
+        split_at = -1
+
+        for chars in (sentence_punct, clause_punct):
+            candidates = [window.rfind(ch, 0, max_chars + 1) for ch in chars]
+            split_at = max(candidates)
+            if split_at + 1 >= min_chars:
+                split_at += 1
+                break
+            split_at = -1
+
+        if split_at == -1:
+            split_at = window.rfind(" ", min_chars, max_chars + 1)
+
+        if split_at == -1:
+            split_at = max_chars
+
+        chunk = remaining[:split_at].strip()
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[split_at:].strip()
+
+    if remaining:
+        chunks.append(remaining)
+
+    merged: list[str] = []
+    for chunk in chunks:
+        if len(chunk) >= min_chars or not merged:
+            merged.append(chunk)
+            continue
+
+        candidate = f"{merged[-1]} {chunk}"
+        if len(candidate) <= max_chars:
+            merged[-1] = candidate
+        else:
+            merged.append(chunk)
+
+    if len(merged) > 1 and len(merged[-1]) < min_chars:
+        candidate = f"{merged[-2]} {merged[-1]}"
+        if len(candidate) <= max_chars:
+            merged[-2] = candidate
+            merged.pop()
+
+    return merged

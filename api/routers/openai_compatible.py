@@ -24,7 +24,8 @@ from ..structures.schemas import (
     VoiceCloneRequest,
     VoiceCloneCapabilities,
 )
-from ..services.text_processing import normalize_text
+from ..config import TTS_AUTOCHUNK, TTS_CHUNK_GAP_MS, TTS_MAX_CHUNK_CHARS, TTS_MIN_CHUNK_CHARS
+from ..services.text_processing import normalize_text, split_text_for_tts
 from ..services.audio_encoding import encode_audio, get_content_type, DEFAULT_SAMPLE_RATE
 from ..services.speech_batcher import submit_speech_request
 
@@ -179,17 +180,55 @@ async def generate_speech(
     # Map voice name
     voice_name = get_voice_name(voice)
 
-    # Generate speech via automatic request batcher
-    try:
-        audio, sr = await submit_speech_request(
-            text=text,
-            voice=voice_name,
-            language=language,
-            instruct=instruct,
-            speed=speed,
-        )
+    chunks = [text]
+    if TTS_AUTOCHUNK:
+        chunks = split_text_for_tts(
+            text,
+            min_chars=TTS_MIN_CHUNK_CHARS,
+            max_chars=TTS_MAX_CHUNK_CHARS,
+        ) or [text]
 
-        return audio, sr
+    # Generate speech via automatic request batcher. Chunked inputs still use
+    # the batcher, so concurrent requests can be grouped while each long input
+    # avoids backend wall-clock limits.
+    try:
+        results = []
+        for chunk in chunks:
+            results.append(
+                await submit_speech_request(
+                    text=chunk,
+                    voice=voice_name,
+                    language=language,
+                    instruct=instruct,
+                    speed=speed,
+                )
+            )
+
+        if len(results) == 1:
+            return results[0]
+
+        sample_rate = results[0][1]
+        gap_samples = max(0, int(sample_rate * TTS_CHUNK_GAP_MS / 1000))
+        gap = np.zeros(gap_samples, dtype=np.float32)
+
+        audio_parts = []
+        for index, (chunk_audio, chunk_sr) in enumerate(results):
+            if chunk_sr != sample_rate:
+                raise RuntimeError(
+                    f"Chunk {index + 1} returned sample rate {chunk_sr}, expected {sample_rate}"
+                )
+            audio_parts.append(chunk_audio.astype(np.float32, copy=False))
+            if gap_samples and index < len(results) - 1:
+                audio_parts.append(gap)
+
+        logger.info(
+            "Auto-chunked TTS input | chunks=%d min_chars=%d max_chars=%d gap_ms=%d",
+            len(results),
+            TTS_MIN_CHUNK_CHARS,
+            TTS_MAX_CHUNK_CHARS,
+            TTS_CHUNK_GAP_MS,
+        )
+        return np.concatenate(audio_parts), sample_rate
 
     except Exception as e:
         raise RuntimeError(f"Speech generation failed: {e}")
