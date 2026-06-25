@@ -147,6 +147,26 @@ SPEECH_BATCH_MAX_QUEUE = int(os.getenv("SPEECH_BATCH_MAX_QUEUE", "256"))
 Maximum queued speech requests waiting for batch worker.
 """
 
+
+# ============================================================================
+# Long Input Auto-Chunking Settings
+# ============================================================================
+
+TTS_AUTOCHUNK = os.getenv("TTS_AUTOCHUNK", "true").lower() == "true"
+"""
+Automatically split longer /v1/audio/speech inputs into smaller chunks and
+concatenate generated audio. This avoids backend timeouts on long prompts.
+"""
+
+TTS_MIN_CHUNK_CHARS = int(os.getenv("TTS_MIN_CHUNK_CHARS", "20"))
+"""Minimum preferred chunk size when auto-chunking text."""
+
+TTS_MAX_CHUNK_CHARS = int(os.getenv("TTS_MAX_CHUNK_CHARS", "70"))
+"""Maximum preferred chunk size when auto-chunking text."""
+
+TTS_CHUNK_GAP_MS = int(os.getenv("TTS_CHUNK_GAP_MS", "120"))
+"""Silence gap inserted between generated chunks, in milliseconds."""
+
 # ============================================================================
 # Intel Extension for PyTorch (IPEX) - Optional
 # ============================================================================
