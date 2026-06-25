@@ -1,24 +1,66 @@
+# syntax=docker/dockerfile:1.7
+
 # Qwen3-TTS OpenAI-Compatible API Server
-# Multi-stage Dockerfile optimized for GPU/CUDA and CPU deployments
+# CUDA-only image for NVIDIA GPUs
+# Target GPU: NVIDIA RTX 4060 / Ada Lovelace / CUDA arch 8.9
+
+ARG CUDA_VERSION=12.8.0
+ARG UBUNTU_VERSION=22.04
+ARG PYTORCH_CUDA=cu128
+ARG BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu${UBUNTU_VERSION}
+ARG BUILDER_IMAGE=nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu${UBUNTU_VERSION}
 
 # =============================================================================
-# Stage 1: Base image with system dependencies
+# Stage 1: Runtime base
 # =============================================================================
-ARG BASE_IMAGE=nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 FROM ${BASE_IMAGE} AS base
 
-# Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV NUMBA_CACHE_DIR=/tmp/numba_cache
+ENV CUDA_HOME=/usr/local/cuda
 
-# NVIDIA Container Runtime environment variables (required for PyTorch CUDA detection)
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:${LD_LIBRARY_PATH}
 
-# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 \
+    python3.11-venv \
+    python3.11-dev \
+    python3-pip \
+    curl \
+    ffmpeg \
+    libsndfile1 \
+    libsox-dev \
+    sox \
+    htop \
+    procps \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
+    && ln -sf /usr/bin/python3 /usr/bin/python
+
+RUN python3 -m venv /opt/venv
+
+ENV PATH=/opt/venv/bin:$PATH
+
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# =============================================================================
+# Stage 2: Builder with CUDA compiler for flash-attn
+# =============================================================================
+FROM ${BUILDER_IMAGE} AS builder
+
+ARG PYTORCH_CUDA
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CUDA_HOME=/usr/local/cuda
+ENV MAX_JOBS=1
+ENV NVCC_THREADS=1
+ENV TORCH_CUDA_ARCH_LIST=8.9
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.11 \
     python3.11-venv \
@@ -27,274 +69,113 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     git \
     curl \
-    ffmpeg \
-    libsndfile1 \
-    libsox-dev \
-    sox \
-    && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
-    && ln -sf /usr/bin/python3 /usr/bin/python
-
-# Set up Python virtual environment
-RUN python3 -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-
-# Upgrade pip
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel
-
-# =============================================================================
-# Stage 2: Builder with CUDA development tools for flash-attn
-# =============================================================================
-FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04 AS builder
-
-# Install Python and build dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.11 \
-    python3.11-venv \
-    python3.11-dev \
-    build-essential \
-    git \
-    curl \
     ninja-build \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
     && ln -sf /usr/bin/python3 /usr/bin/python
 
-# Set up Python virtual environment
 RUN python3 -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
+
+ENV PATH=/opt/venv/bin:$PATH
+
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
 WORKDIR /build
 
-# Copy dependency files
-COPY pyproject.toml ./
-COPY README.md ./
+COPY pyproject.toml README.md ./
 
-# Install Python dependencies
 RUN pip install --no-cache-dir \
-    torch>=2.0.0 \
-    torchaudio>=2.0.0 \
-    --index-url https://download.pytorch.org/whl/cu121
+    "torch>=2.0.0" \
+    "torchaudio>=2.0.0" \
+    --index-url "https://download.pytorch.org/whl/${PYTORCH_CUDA}"
 
-# Install the main package dependencies
 RUN pip install --no-cache-dir \
-    transformers>=4.40.0 \
-    accelerate>=1.0.0 \
+    "transformers>=4.40.0" \
+    "accelerate>=1.0.0" \
     librosa \
     soundfile \
     pydub \
     numpy \
     scipy \
     einops \
-    onnxruntime-gpu
-
-# Install FastAPI and server dependencies
-RUN pip install --no-cache-dir \
-    fastapi>=0.109.0 \
-    uvicorn[standard]>=0.27.0 \
+    onnxruntime-gpu \
+    "fastapi>=0.109.0" \
+    "uvicorn[standard]>=0.27.0" \
     python-multipart \
-    pydantic>=2.0.0 \
+    "pydantic>=2.0.0" \
     inflect \
-    aiofiles
+    aiofiles \
+    ninja \
+    packaging \
+    psutil
 
-# Install ninja for faster flash-attn compilation
-RUN pip install --no-cache-dir ninja packaging wheel
+RUN mkdir -p /wheelhouse \
+    && MAX_JOBS="${MAX_JOBS}" NVCC_THREADS="${NVCC_THREADS}" pip wheel --no-cache-dir --no-build-isolation --wheel-dir /wheelhouse flash-attn \
+    && pip install --no-cache-dir /wheelhouse/flash_attn*.whl
 
-# Install flash-attention 2 for optimized attention (requires CUDA)
-RUN pip install --no-cache-dir flash-attn --no-build-isolation
+RUN python - <<'PY'
+import torch
+
+print("torch:", torch.__version__)
+print("torch CUDA:", torch.version.cuda)
+print("CUDA available during build:", torch.cuda.is_available())
+
+import flash_attn
+import flash_attn_2_cuda
+
+print("flash-attn import: OK")
+print("flash_attn_2_cuda import: OK")
+PY
 
 # =============================================================================
-# Stage 3: Production image (official backend)
+# Export built wheels for flash-attn
+# =============================================================================
+FROM scratch AS wheelhouse
+
+COPY --from=builder /wheelhouse /
+
+# =============================================================================
+# Stage 3: Production image
 # =============================================================================
 FROM base AS production
 
 WORKDIR /app
 
-# Copy virtual environment from builder
 COPY --from=builder /opt/venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
 
-# Copy application code
+ENV PATH=/opt/venv/bin:$PATH
+
 COPY . .
 
-# Install the package in editable mode
 RUN pip install --no-cache-dir -e .
 
-# Create non-root user for security
+RUN python - <<'PY'
+import torch
+import flash_attn
+import flash_attn_2_cuda
+
+print("production torch:", torch.__version__)
+print("production torch CUDA:", torch.version.cuda)
+print("production flash-attn import: OK")
+print("production flash_attn_2_cuda import: OK")
+PY
+
 RUN useradd --create-home --shell /bin/bash appuser \
-    && mkdir -p /tmp/numba_cache \
-    && chown -R appuser:appuser /app /tmp/numba_cache
+    && mkdir -p /models /tmp/numba_cache /home/appuser/.cache/huggingface \
+    && chown -R appuser:appuser /app /models /tmp/numba_cache /home/appuser/.cache
+
 USER appuser
 
-# Environment variables
 ENV HOST=0.0.0.0
 ENV PORT=8880
 ENV WORKERS=1
 ENV PYTHONPATH=/app
 ENV TTS_BACKEND=official
-
-# Expose port
-EXPOSE 8880
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:8880/health || exit 1
-
-# Run the server
-CMD ["python", "-m", "api.main"]
-
-# =============================================================================
-# Stage 4: vLLM-Omni backend (with vLLM dependencies)
-# =============================================================================
-FROM base AS vllm-builder
-
-WORKDIR /build
-
-# Copy dependency files
-COPY pyproject.toml ./
-COPY README.md ./
-
-# Install base dependencies first
-RUN pip install --no-cache-dir \
-    torch>=2.0.0 \
-    torchaudio>=2.0.0 \
-    --index-url https://download.pytorch.org/whl/cu121
-
-# Install vLLM (this may take a while)
-RUN pip install --no-cache-dir vllm>=0.4.0
-
-# Install the main package dependencies
-RUN pip install --no-cache-dir \
-    transformers>=4.40.0 \
-    accelerate>=1.0.0 \
-    librosa \
-    soundfile \
-    pydub \
-    numpy \
-    scipy \
-    einops \
-    onnxruntime-gpu
-
-# Install FastAPI and server dependencies
-RUN pip install --no-cache-dir \
-    fastapi>=0.109.0 \
-    uvicorn[standard]>=0.27.0 \
-    python-multipart \
-    pydantic>=2.0.0 \
-    inflect \
-    aiofiles
-
-# Optional: Install flash-attention for better performance
-RUN pip install --no-cache-dir flash-attn --no-build-isolation || true
-
-# =============================================================================
-# Stage 5: vLLM-Omni production image
-# =============================================================================
-FROM base AS vllm-production
-
-WORKDIR /app
-
-# Copy virtual environment from vllm-builder
-COPY --from=vllm-builder /opt/venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-
-# Copy application code
-COPY . .
-
-# Install the package in editable mode with vllm extras
-RUN pip install --no-cache-dir -e ".[vllm]"
-
-# Create non-root user for security
-RUN useradd --create-home --shell /bin/bash appuser \
-    && mkdir -p /tmp/numba_cache \
-    && chown -R appuser:appuser /app /tmp/numba_cache
-USER appuser
-
-# Environment variables
-ENV HOST=0.0.0.0
-ENV PORT=8880
-ENV WORKERS=1
-ENV PYTHONPATH=/app
-ENV TTS_BACKEND=vllm_omni
-
-# Expose port
-EXPOSE 8880
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
-    CMD curl -f http://localhost:8880/health || exit 1
-
-# Run the server
-CMD ["python", "-m", "api.main"]
-
-# =============================================================================
-# CPU-only variant
-# =============================================================================
-FROM python:3.11-slim AS cpu-base
-
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV NUMBA_CACHE_DIR=/tmp/numba_cache
-
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    git \
-    curl \
-    ffmpeg \
-    libsndfile1 \
-    libsox-dev \
-    sox \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-# Copy dependency files first for better caching
-COPY pyproject.toml README.md ./
-
-# Install PyTorch (CPU version)
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
-    && pip install --no-cache-dir \
-    torch>=2.0.0 \
-    torchaudio>=2.0.0 \
-    --index-url https://download.pytorch.org/whl/cpu
-
-# Install Python dependencies
-RUN pip install --no-cache-dir \
-    transformers>=4.40.0 \
-    accelerate>=1.0.0 \
-    librosa \
-    soundfile \
-    pydub \
-    numpy \
-    scipy \
-    einops \
-    onnxruntime \
-    fastapi>=0.109.0 \
-    uvicorn[standard]>=0.27.0 \
-    python-multipart \
-    pydantic>=2.0.0 \
-    inflect \
-    aiofiles
-
-# Copy application code
-COPY . .
-
-# Install the package
-RUN pip install --no-cache-dir -e .
-
-# Create non-root user
-RUN useradd --create-home --shell /bin/bash appuser \
-    && mkdir -p /tmp/numba_cache \
-    && chown -R appuser:appuser /app /tmp/numba_cache
-USER appuser
-
-# Environment variables
-ENV HOST=0.0.0.0
-ENV PORT=8880
-ENV WORKERS=1
-ENV PYTHONPATH=/app
+ENV TTS_MODEL_NAME=/models/Qwen3-TTS-12Hz-1.7B-CustomVoice
+ENV HF_HOME=/home/appuser/.cache/huggingface
+ENV TRANSFORMERS_CACHE=/home/appuser/.cache/huggingface
+ENV TOKENIZERS_PARALLELISM=false
 
 EXPOSE 8880
 

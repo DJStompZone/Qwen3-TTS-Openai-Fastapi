@@ -1,37 +1,41 @@
 version: '3.8'
 
 services:
-  # GPU-enabled service with official backend (default)
   qwen3-tts-gpu:
     build:
       context: .
       dockerfile: Dockerfile
       target: production
-    container_name: qwen3-tts-api
-    network_mode: host
+
+    image: qwen3-tts-api:cuda-flashattn
+    container_name: qwen3-tts-api-flashattn
+
     ports:
-      - "8880:8880"
+      - "192.168.10.100:8880:8880"
+
     environment:
-      - HOST=0.0.0.0
-      - PORT=8880
-      - WORKERS=1
-      - CORS_ORIGINS=*
-      - TTS_BACKEND=official
-      - TTS_WARMUP_ON_START=false
-      # When using device_ids filter, the GPU appears as device 0 inside container
-      - CUDA_VISIBLE_DEVICES=0
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      HOST: "0.0.0.0"
+      PORT: "8880"
+      WORKERS: "1"
+      CORS_ORIGINS: "*"
+      TTS_BACKEND: "official"
+      TTS_DEVICE: "cuda"
+      TTS_WARMUP_ON_START: "false"
+      TTS_MODEL_NAME: "/models/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+      HF_HOME: "/home/appuser/.cache/huggingface"
+      TRANSFORMERS_CACHE: "/home/appuser/.cache/huggingface"
+      CUDA_VISIBLE_DEVICES: "0"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+
     volumes:
-      # Mount model cache for persistence
-      - ~/.cache/huggingface:/home/appuser/.cache/huggingface
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ['2']
-              capabilities: [gpu]
+      - "H:/ai-cache:/models:ro"
+      - "H:/ai-cache/voice_library:/app/voice_library"
+      - "H:/ai-cache/huggingface:/home/appuser/.cache/huggingface"
+
+    gpus: all
+
     restart: unless-stopped
+
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8880/health"]
       interval: 30s
@@ -84,7 +88,7 @@ services:
   qwen3-tts-cpu:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.base
       target: cpu-base
     container_name: qwen3-tts-api-cpu
     network_mode: host
